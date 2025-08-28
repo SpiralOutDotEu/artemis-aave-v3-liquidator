@@ -5,3 +5,12 @@ out/
 borrowers.json
 a
 a.json
+
+# Environment files (contain sensitive data like private keys and RPC URLs)
+*.env
+
+# botdata
+.botdata/
+
+# python
+__pycache__/
