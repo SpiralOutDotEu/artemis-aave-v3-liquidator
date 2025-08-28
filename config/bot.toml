@@ -12,7 +12,7 @@ collector = "time"        # "time" | "block" | "pending"
 chain_id = 8453
 rpc_url = "${BASE_RPC_URL}"         # env override pattern
 explorer.base_url = "https://basescan.org"
-start_block = 34700000              # seed logs from here (per deployment recommended) - recent for testing
+start_block = 34800000              # Bot will start scanning from this block (never earlier, even if cache exists)
 
 # Deployments under each chain (AAVE, SEAMLESS/Seashell)
 [deployments.base.AAVE]
@@ -58,6 +58,14 @@ wallets = ["${PK1}"]   # support multi-wallet in M8
 submitters = ["public"]          # ["public","private"]
 private_endpoints = []           # fill at M6
 tip_fraction_of_profit_bps = 500 # 5% of expected $profit as priority fee cap
+
+# Rate limiting configuration to avoid RPC throttling
+[rate_limiting]
+log_block_range = 100            # Number of blocks to process per RPC call (reduced from 500)
+request_delay_ms = 500           # Delay between RPC requests in milliseconds
+max_concurrent_requests = 3      # Maximum concurrent RPC requests
+retry_attempts = 3               # Number of retry attempts for failed requests
+retry_delay_ms = 1000            # Delay before retrying failed requests
 
 [simulation]
 out_dir = ".botdata/sim"
