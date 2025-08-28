@@ -2,7 +2,9 @@
 
 target/
 out/
-borrowers.json
+*.db
+*.sqlite
+*.sqlite3
 a
 a.json
 
