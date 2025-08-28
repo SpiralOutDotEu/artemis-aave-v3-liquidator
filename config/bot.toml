@@ -1,0 +1,66 @@
+# Artemis Aave V3 Liquidator Configuration
+# This file contains all runtime parameters for the liquidator bot
+
+[app]
+mode = "live"             # "live" | "simulate"
+log_level = "info"
+data_dir = ".botdata"     # sqlite/db, logs, cache
+tick_ms = 10000           # 10 seconds for faster testing (was 300000 = 5 minutes)
+collector = "time"        # "time" | "block" | "pending"
+
+[chains.base]
+chain_id = 8453
+rpc_url = "${BASE_RPC_URL}"         # env override pattern
+explorer.base_url = "https://basescan.org"
+start_block = 34700000              # seed logs from here (per deployment recommended) - recent for testing
+
+# Deployments under each chain (AAVE, SEAMLESS/Seashell)
+[deployments.base.AAVE]
+pool = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
+pool_data_provider = "0x2d8A3C5677189723C4cB8873CfC9C8976FDF38Ac"
+oracle = "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156"
+l2_encoder = "0x39e97c588B2907Fb67F44fea256Ae3BA064207C5"
+uniswap_v3.factory = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
+uniswap_v3.quoter  = "0x0000000000000000000000000000000000000000" # fill correct address if available
+uniswap_v3.router  = "0x0000000000000000000000000000000000000000" # optional router
+weth = "0x4200000000000000000000000000000000000006"
+
+[deployments.base.SEAMLESS]
+pool = "0x8F44Fd754285aa6A2b8B9B97739B79746e0475a7"
+pool_data_provider = "0x2A0979257105834789bC6b9E1B00446DFbA8dFBa"
+oracle = "0xFDd4e83890BCcd1fbF9b10d71a5cc0a738753b01"
+l2_encoder = "0xceceF475167f7BFD8995c0cbB577644b623cD7Cf"
+uniswap_v3.factory = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
+uniswap_v3.quoter  = "0x0000000000000000000000000000000000000000"
+weth = "0x4200000000000000000000000000000000000006"
+
+# Token universe & pools we care about – per chain (can be shared ref)
+[tokens.base.USDC]
+address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"    # fill per chain
+decimals = 6
+priority = 10            # use to sort candidates (higher = more interesting)
+
+[tokens.base.WETH]
+address = "0x4200000000000000000000000000000000000006"
+decimals = 18
+priority = 10
+
+# Strategy knobs
+[strategy]
+max_candidates = 50
+close_factor_bps = 5000         # default 50% (protocol may override)
+min_profit_usd = 10.0
+slippage_bps = 50                # 0.50%
+prefer_atoken = false
+
+[execution]
+wallets = ["${PK1}"]   # support multi-wallet in M8
+submitters = ["public"]          # ["public","private"]
+private_endpoints = []           # fill at M6
+tip_fraction_of_profit_bps = 500 # 5% of expected $profit as priority fee cap
+
+[simulation]
+out_dir = ".botdata/sim"
+jsonl = "opportunities.jsonl"
+sqlite = "sim.db"
+watch_liquidations = true

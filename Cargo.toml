@@ -8,9 +8,10 @@ edition = "2021"
 [dependencies]
 bindings-aave = { path = "./crates/bindings-aave" }
 bindings-liquidator = { path = "./crates/bindings-liquidator" }
+bot-config = { path = "./crates/bot-config" }
 
-artemis-core = { git = "https://github.com/paradigmxyz/artemis"}
-ethers = { version = "2", features = ["ws", "rustls"]}
+artemis-core = { git = "https://github.com/paradigmxyz/artemis" }
+ethers = { version = "2", features = ["ws", "rustls"] }
 tokio = { version = "1.18", features = ["full"] }
 dotenv = "0.15.0"
 async-trait = "0.1.64"
@@ -32,3 +33,5 @@ mockito = "1.1.0"
 serde_json = "1.0.105"
 ethers-contract = "2.0.9"
 hex = "0.4.3"
+chrono = { version = "0.4", features = ["serde"] }
+tracing-appender = "0.2"
