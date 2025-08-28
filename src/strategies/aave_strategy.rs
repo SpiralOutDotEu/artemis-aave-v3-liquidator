@@ -1,5 +1,6 @@
-use super::types::Config;
 use crate::collectors::time_collector::NewTick;
+use crate::storage::Storage;
+use crate::strategies::types::Config;
 use anyhow::{anyhow, Result};
 use artemis_core::executors::mempool_executor::{GasBidInfo, SubmitTxToMempool};
 use artemis_core::types::Strategy;
@@ -21,13 +22,10 @@ use ethers::{
 use ethers_contract::Multicall;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::Write;
 use std::iter::zip;
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::types::{Action, Event};
 
@@ -71,8 +69,8 @@ pub enum Deployment {
 /// Operational constants for the liquidator bot
 /// 
 /// These values are tuned for optimal performance and RPC compatibility
-pub const LOG_BLOCK_RANGE: u64 = 500; // RPC endpoint limit for log queries
-pub const MULTICALL_CHUNK_SIZE: usize = 100; // Batch size for multicall operations
+pub const DEFAULT_LOG_BLOCK_RANGE: u64 = 100; // Default block range for log queries
+pub const DEFAULT_MULTICALL_CHUNK_SIZE: usize = 50; // Default batch size for multicall operations
 pub const PRICE_ONE: u64 = 100000000; // Price precision constant (8 decimals)
 
 /// Persistent state cache for bot restarts
@@ -82,9 +80,9 @@ pub const PRICE_ONE: u64 = 100000000; // Price precision constant (8 decimals)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StateCache {
     /// Last blockchain block that was processed
-    last_block_number: u64,
+    pub last_block_number: u64,
     /// Mapping of borrower addresses to their current state
-    borrowers: HashMap<Address, Borrower>,
+    pub borrowers: HashMap<Address, Borrower>,
 }
 
 /// Current state of the Aave V3 pool
@@ -103,11 +101,11 @@ struct PoolState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Borrower {
     /// User's wallet address
-    address: Address,
+    pub address: Address,
     /// Set of assets the user has supplied as collateral
-    collateral: HashSet<Address>,
+    pub collateral: HashSet<Address>,
     /// Set of assets the user has borrowed (creating debt)
-    debt: HashSet<Address>,
+    pub debt: HashSet<Address>,
 }
 
 /// Configuration for a specific ERC20 token in the Aave V3 protocol
@@ -139,7 +137,6 @@ pub struct TokenConfig {
 /// This strategy monitors the Aave V3 protocol for users whose positions
 /// have become unhealthy (health factor < 1.0) and executes liquidations
 /// when profitable opportunities are detected.
-#[derive(Debug)]
 #[allow(dead_code)]
 pub struct AaveStrategy<M> {
     /// Ethers client for blockchain interaction
@@ -170,9 +167,19 @@ pub struct AaveStrategy<M> {
     default_close_factor: U256,
     /// Data directory for storing cache and logs
     data_dir: String,
+    /// Storage backend for borrower state persistence
+    storage: Arc<dyn Storage>,
+    /// Rate limiting configuration
+    log_block_range: u64,
+    request_delay_ms: u64,
+    max_concurrent_requests: usize,
+    retry_attempts: u32,
+    retry_delay_ms: u64,
 }
 
 impl<M: Middleware + 'static> AaveStrategy<M> {
+
+
     /// Creates a new AaveStrategy instance
     /// 
     /// Initializes the strategy with the provided configuration and sets up
@@ -185,6 +192,7 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
     /// * `addresses` - Contract addresses for the target deployment
     /// * `start_block` - Starting block number for efficient scanning
     /// * `data_dir` - Directory for storing persistent data
+    /// * `storage` - Storage backend for state persistence
     /// 
     /// # Returns
     /// * `Self` - Fully initialized AaveStrategy instance
@@ -195,6 +203,7 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         addresses: crate::addresses::Addresses,
         start_block: u64,
         data_dir: String,
+        storage: Arc<dyn Storage>,
     ) -> Self {
         Self {
             client,
@@ -217,6 +226,13 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
             max_close_factor: U256::from(10000),
             default_close_factor: U256::from(5000),
             data_dir,
+            storage,
+            // Rate limiting configuration with defaults
+            log_block_range: 100,
+            request_delay_ms: 500,
+            max_concurrent_requests: 3,
+            retry_attempts: 3,
+            retry_delay_ms: 1000,
         }
     }
 }
@@ -248,14 +264,17 @@ impl<M: Middleware + 'static> Strategy<Event, Action> for AaveStrategy<M> {
     /// # Returns
     /// * `Result<()>` - Success or error from synchronization
     async fn sync_state(&mut self) -> Result<()> {
-        info!("syncing state");
+        info!("🔄 Starting state synchronization...");
+        info!("📍 Configured start block: {} (from bot.toml)", self.config.creation_block);
 
         self.update_token_configs().await?;
         self.approve_tokens().await?;
-        self.load_cache()?;
+        self.load_cache().await?;
+        
+        info!("📍 Effective start block after cache load: {}", self.last_block_number);
         self.update_state().await?;
 
-        info!("done syncing state");
+        info!("✅ State synchronization complete");
         Ok(())
     }
 
@@ -405,7 +424,7 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
             .collect();
 
         // Process borrowers in chunks to avoid RPC limits
-        for chunk in borrowers.chunks(MULTICALL_CHUNK_SIZE) {
+        for chunk in borrowers.chunks(self.max_concurrent_requests) {
             multicall.clear_calls();
 
             for borrower in chunk {
@@ -429,7 +448,7 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         Ok(underwater_borrowers)
     }
 
-    /// Loads borrower state from persistent cache file
+    /// Loads borrower state from persistent storage
     /// 
     /// Attempts to restore the bot's state from a previous run, including
     /// the last processed block number and borrower information. If no cache
@@ -437,17 +456,25 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
     /// 
     /// # Returns
     /// * `Result<()>` - Success or error from cache loading
-    fn load_cache(&mut self) -> Result<()> {
-        let cache_file = Path::new(&self.data_dir).join("borrowers.json");
-        match File::open(&cache_file) {
-            Ok(file) => {
-                let cache: StateCache = serde_json::from_reader(file)?;
-                info!("read state cache from file: {}", cache_file.display());
-                self.last_block_number = cache.last_block_number;
+    async fn load_cache(&mut self) -> Result<()> {
+        match self.storage.load_cache().await {
+            Ok(cache) => {
+                info!("Loaded state cache from storage: {} borrowers, last block: {}", 
+                      cache.borrowers.len(), cache.last_block_number);
+                
+                // Ensure we never go earlier than the configured start_block
+                let effective_start_block = std::cmp::max(cache.last_block_number, self.config.creation_block);
+                
+                if effective_start_block != cache.last_block_number {
+                    info!("⚠️ Adjusted start block from {} to {} (respecting configured start_block: {})", 
+                          cache.last_block_number, effective_start_block, self.config.creation_block);
+                }
+                
+                self.last_block_number = effective_start_block;
                 self.borrowers = cache.borrowers;
             }
-            Err(_) => {
-                info!("no state cache file found at {}, creating new one", cache_file.display());
+            Err(e) => {
+                info!("Failed to load state cache from storage: {}, using creation block: {}", e, self.config.creation_block);
                 self.last_block_number = self.config.creation_block;
             }
         };
@@ -632,16 +659,18 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
             info!("💤 No new blocks to process - blockchain is quiet");
         }
 
-        // Persist updated state to cache file
+        // Persist updated state to storage
         let cache = StateCache {
             last_block_number: latest_block.as_u64(),
             borrowers: self.borrowers.clone(),
         };
         self.last_block_number = latest_block.as_u64();
-        let cache_file = Path::new(&self.data_dir).join("borrowers.json");
-        let mut file = File::create(&cache_file)?;
-        file.write_all(serde_json::to_string(&cache)?.as_bytes())?;
-        info!("💾 State cache written to {} ({} borrowers saved)", cache_file.display(), self.borrowers.len());
+        
+        if let Err(e) = self.storage.save_cache(&cache).await {
+            error!("Failed to save state cache to storage: {}", e);
+        } else {
+            info!("💾 State cache saved to storage ({} borrowers saved)", self.borrowers.len());
+        }
 
         Ok(())
     }
@@ -662,20 +691,27 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         let pool = Pool::<M>::new(self.config.pool_address, self.client.clone());
 
         let mut res = Vec::new();
-        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / LOG_BLOCK_RANGE as u64) + 1;
+        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / self.log_block_range) + 1;
         let mut current_chunk = 0;
         
         for start_block in
-            (from_block.as_u64()..to_block.as_u64()).step_by(LOG_BLOCK_RANGE as usize)
+            (from_block.as_u64()..to_block.as_u64()).step_by(self.log_block_range as usize)
         {
             current_chunk += 1;
-            let end_block = std::cmp::min(start_block + LOG_BLOCK_RANGE - 1, to_block.as_u64());
+            let end_block = std::cmp::min(start_block + self.log_block_range - 1, to_block.as_u64());
             
             if current_chunk % 10 == 0 || current_chunk == total_chunks {
                 info!("Processing borrow logs chunk {}/{} (blocks {}-{})", current_chunk, total_chunks, start_block, end_block);
             }
             
             info!("⏳ Waiting for RPC response for borrow logs (blocks {}-{})...", start_block, end_block);
+            
+            // Add delay between requests to respect rate limits
+            if current_chunk > 1 {
+                let delay = std::time::Duration::from_millis(self.request_delay_ms);
+                tokio::time::sleep(delay).await;
+            }
+            
             let query_result = tokio::time::timeout(
                 std::time::Duration::from_secs(30), // 30 second timeout per chunk
                 pool.borrow_filter()
@@ -689,11 +725,97 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 Ok(Ok(logs)) => logs,
                 Ok(Err(e)) => {
                     error!("Error fetching borrow logs for blocks {}-{}: {}", start_block, end_block, e);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying borrow logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match pool.borrow_filter()
+                            .from_block(start_block)
+                            .to_block(end_block)
+                            .address(ValueOrArray::Value(self.config.pool_address))
+                            .query()
+                            .await {
+                            Ok(logs) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Borrow logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch borrow logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
                 Err(_) => {
                     error!("Timeout fetching borrow logs for blocks {}-{}", start_block, end_block);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying borrow logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            pool.borrow_filter()
+                                .from_block(start_block)
+                                .to_block(end_block)
+                                .address(ValueOrArray::Value(self.config.pool_address))
+                                .query()
+                        ).await {
+                            Ok(Ok(logs)) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Borrow logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch borrow logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                            Err(_) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch borrow logs for blocks {}-{} after {} retries: timeout", 
+                                           start_block, end_block, self.retry_attempts);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: timeout", attempt, start_block, end_block);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
             };
             
@@ -720,20 +842,27 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         let pool = Pool::<M>::new(self.config.pool_address, self.client.clone());
 
         let mut res = Vec::new();
-        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / LOG_BLOCK_RANGE as u64) + 1;
+        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / self.log_block_range) + 1;
         let mut current_chunk = 0;
         
         for start_block in
-            (from_block.as_u64()..to_block.as_u64()).step_by(LOG_BLOCK_RANGE as usize)
+            (from_block.as_u64()..to_block.as_u64()).step_by(self.log_block_range as usize)
         {
             current_chunk += 1;
-            let end_block = std::cmp::min(start_block + LOG_BLOCK_RANGE - 1, to_block.as_u64());
+            let end_block = std::cmp::min(start_block + self.log_block_range - 1, to_block.as_u64());
             
             if current_chunk % 10 == 0 || current_chunk == total_chunks {
                 info!("Processing supply logs chunk {}/{} (blocks {}-{})", current_chunk, total_chunks, start_block, end_block);
             }
             
             info!("⏳ Waiting for RPC response for supply logs (blocks {}-{})...", start_block, end_block);
+            
+            // Add delay between requests to respect rate limits
+            if current_chunk > 1 {
+                let delay = std::time::Duration::from_millis(self.request_delay_ms);
+                tokio::time::sleep(delay).await;
+            }
+            
             let query_result = tokio::time::timeout(
                 std::time::Duration::from_secs(30), // 30 second timeout per chunk
                 pool.supply_filter()
@@ -747,11 +876,97 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 Ok(Ok(logs)) => logs,
                 Ok(Err(e)) => {
                     error!("Error fetching supply logs for blocks {}-{}: {}", start_block, end_block, e);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying supply logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match pool.supply_filter()
+                            .from_block(start_block)
+                            .to_block(end_block)
+                            .address(ValueOrArray::Value(self.config.pool_address))
+                            .query()
+                            .await {
+                            Ok(logs) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Supply logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch supply logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
                 Err(_) => {
                     error!("Timeout fetching supply logs for blocks {}-{}", start_block, end_block);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying supply logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            pool.supply_filter()
+                                .from_block(start_block)
+                                .to_block(end_block)
+                                .address(ValueOrArray::Value(self.config.pool_address))
+                                .query()
+                        ).await {
+                            Ok(Ok(logs)) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Supply logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch supply logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                            Err(_) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch supply logs for blocks {}-{} after {} retries: timeout", 
+                                           start_block, end_block, self.retry_attempts);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: timeout", attempt, start_block, end_block);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
             };
             
@@ -778,14 +993,14 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         let pool = Pool::<M>::new(self.config.pool_address, self.client.clone());
 
         let mut res = Vec::new();
-        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / LOG_BLOCK_RANGE as u64) + 1;
+        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / self.log_block_range) + 1;
         let mut current_chunk = 0;
         
         for start_block in
-            (from_block.as_u64()..to_block.as_u64()).step_by(LOG_BLOCK_RANGE as usize)
+            (from_block.as_u64()..to_block.as_u64()).step_by(self.log_block_range as usize)
         {
             current_chunk += 1;
-            let end_block = std::cmp::min(start_block + LOG_BLOCK_RANGE - 1, to_block.as_u64());
+            let end_block = std::cmp::min(start_block + self.log_block_range - 1, to_block.as_u64());
             
             if current_chunk % 10 == 0 || current_chunk == total_chunks {
                 info!("Processing repay logs chunk {}/{} (blocks {}-{})", current_chunk, total_chunks, start_block, end_block);
@@ -805,11 +1020,97 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 Ok(Ok(logs)) => logs,
                 Ok(Err(e)) => {
                     error!("Error fetching repay logs for blocks {}-{}: {}", start_block, end_block, e);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying repay logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match pool.repay_filter()
+                            .from_block(start_block)
+                            .to_block(end_block)
+                            .address(ValueOrArray::Value(self.config.pool_address))
+                            .query()
+                            .await {
+                            Ok(logs) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Repay logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch repay logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
                 Err(_) => {
                     error!("Timeout fetching repay logs for blocks {}-{}", start_block, end_block);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying repay logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            pool.repay_filter()
+                                .from_block(start_block)
+                                .to_block(end_block)
+                                .address(ValueOrArray::Value(self.config.pool_address))
+                                .query()
+                        ).await {
+                            Ok(Ok(logs)) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Repay logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch repay logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                            Err(_) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch repay logs for blocks {}-{} after {} retries: timeout", 
+                                           start_block, end_block, self.retry_attempts);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: timeout", attempt, start_block, end_block);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
             };
             
@@ -836,14 +1137,14 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         let pool = Pool::<M>::new(self.config.pool_address, self.client.clone());
 
         let mut res = Vec::new();
-        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / LOG_BLOCK_RANGE as u64) + 1;
+        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / self.log_block_range) + 1;
         let mut current_chunk = 0;
         
         for start_block in
-            (from_block.as_u64()..to_block.as_u64()).step_by(LOG_BLOCK_RANGE as usize)
+            (from_block.as_u64()..to_block.as_u64()).step_by(self.log_block_range as usize)
         {
             current_chunk += 1;
-            let end_block = std::cmp::min(start_block + LOG_BLOCK_RANGE - 1, to_block.as_u64());
+            let end_block = std::cmp::min(start_block + self.log_block_range - 1, to_block.as_u64());
             
             if current_chunk % 10 == 0 || current_chunk == total_chunks {
                 info!("Processing withdraw logs chunk {}/{} (blocks {}-{})", current_chunk, total_chunks, start_block, end_block);
@@ -863,11 +1164,97 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 Ok(Ok(logs)) => logs,
                 Ok(Err(e)) => {
                     error!("Error fetching withdraw logs for blocks {}-{}: {}", start_block, end_block, e);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying withdraw logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match pool.withdraw_filter()
+                            .from_block(start_block)
+                            .to_block(end_block)
+                            .address(ValueOrArray::Value(self.config.pool_address))
+                            .query()
+                            .await {
+                            Ok(logs) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Withdraw logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch withdraw logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
                 Err(_) => {
                     error!("Timeout fetching withdraw logs for blocks {}-{}", start_block, end_block);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying withdraw logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            pool.withdraw_filter()
+                                .from_block(start_block)
+                                .to_block(end_block)
+                                .address(ValueOrArray::Value(self.config.pool_address))
+                                .query()
+                        ).await {
+                            Ok(Ok(logs)) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Withdraw logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch withdraw logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                            Err(_) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch withdraw logs for blocks {}-{} after {} retries: timeout", 
+                                           start_block, end_block, self.retry_attempts);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: timeout", attempt, start_block, end_block);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
             };
             
@@ -894,14 +1281,14 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         let pool = Pool::<M>::new(self.config.pool_address, self.client.clone());
 
         let mut res = Vec::new();
-        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / LOG_BLOCK_RANGE as u64) + 1;
+        let total_chunks = ((to_block.as_u64() - from_block.as_u64()) / self.log_block_range) + 1;
         let mut current_chunk = 0;
         
         for start_block in
-            (from_block.as_u64()..to_block.as_u64()).step_by(LOG_BLOCK_RANGE as usize)
+            (from_block.as_u64()..to_block.as_u64()).step_by(self.log_block_range as usize)
         {
             current_chunk += 1;
-            let end_block = std::cmp::min(start_block + LOG_BLOCK_RANGE - 1, to_block.as_u64());
+            let end_block = std::cmp::min(start_block + self.log_block_range - 1, to_block.as_u64());
             
             if current_chunk % 10 == 0 || current_chunk == total_chunks {
                 info!("Processing liquidation logs chunk {}/{} (blocks {}-{})", current_chunk, total_chunks, start_block, end_block);
@@ -921,11 +1308,97 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 Ok(Ok(logs)) => logs,
                 Ok(Err(e)) => {
                     error!("Error fetching liquidation logs for blocks {}-{}: {}", start_block, end_block, e);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying liquidation logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match pool.liquidation_call_filter()
+                            .from_block(start_block)
+                            .to_block(end_block)
+                            .address(ValueOrArray::Value(self.config.pool_address))
+                            .query()
+                            .await {
+                            Ok(logs) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Liquidation logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch liquidation logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
                 Err(_) => {
                     error!("Timeout fetching liquidation logs for blocks {}-{}", start_block, end_block);
-                    continue;
+                    // Retry this block range instead of skipping
+                    let mut retry_logs = Vec::new();
+                    let mut retry_success = false;
+                    
+                    for attempt in 1..=self.retry_attempts {
+                        let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        warn!("⚠️ Retrying liquidation logs for blocks {}-{} (attempt {}/{}), waiting {}ms...", 
+                              start_block, end_block, attempt, self.retry_attempts, delay_ms);
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            pool.liquidation_call_filter()
+                                .from_block(start_block)
+                                .to_block(end_block)
+                                .address(ValueOrArray::Value(self.config.pool_address))
+                                .query()
+                        ).await {
+                            Ok(Ok(logs)) => {
+                                retry_logs = logs;
+                                retry_success = true;
+                                info!("✅ Liquidation logs retry succeeded on attempt {} for blocks {}-{}", attempt, start_block, end_block);
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch liquidation logs for blocks {}-{} after {} retries: {}", 
+                                           start_block, end_block, self.retry_attempts, e);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: {}", attempt, start_block, end_block, e);
+                                }
+                            }
+                            Err(_) => {
+                                if attempt == self.retry_attempts {
+                                    error!("❌ Failed to fetch liquidation logs for blocks {}-{} after {} retries: timeout", 
+                                           start_block, end_block, self.retry_attempts);
+                                } else {
+                                    warn!("⚠️ Retry attempt {} failed for blocks {}-{}: timeout", attempt, start_block, end_block);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !retry_success {
+                        continue; // Skip this block range if all retries failed
+                    }
+                    
+                    retry_logs
                 }
             };
             
