@@ -23,3 +23,9 @@ pub mod strategies;
 /// Provides centralized access to contract addresses
 /// and deployment-specific configurations.
 pub mod addresses;
+
+/// Storage module for data persistence
+/// 
+/// Provides abstract storage interfaces and implementations
+/// for borrower state and bot configuration persistence.
+pub mod storage;
