@@ -8,6 +8,7 @@ Then open http://localhost:5000 in your browser
 import os
 import glob
 import re
+import sqlite3
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 import json
@@ -1370,13 +1371,80 @@ def api_logs():
         logs, stats = read_logs()
     return jsonify({'logs': logs, 'stats': stats})
 
-# Add new API endpoint for borrowers data
+# Add new API endpoint for borrowers data from SQLite
 @app.route('/api/borrowers')
 def api_borrowers():
     try:
-        with open('.botdata/borrowers.json', 'r') as f:
-            data = json.load(f)
+        # Try to connect to SQLite database
+        db_path = '.botdata/borrowers.db'
+        if not os.path.exists(db_path):
+            return jsonify({'error': 'SQLite database not found', 'path': db_path}), 404
+        
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Get last processed block number
+        cursor.execute("SELECT value FROM bot_state WHERE key = 'last_block_number'")
+        block_result = cursor.fetchone()
+        last_block_number = int(block_result[0]) if block_result else 0
+        
+        # Get all borrowers with their collateral and debt counts
+        cursor.execute("""
+            SELECT address, collateral_count, debt_count, created_at, updated_at 
+            FROM borrowers 
+            ORDER BY updated_at DESC
+        """)
+        borrowers_data = cursor.fetchall()
+        
+        # Get detailed asset information for each borrower
+        borrowers = []
+        for borrower_row in borrowers_data:
+            address, collateral_count, debt_count, created_at, updated_at = borrower_row
+            
+            # Get collateral assets
+            cursor.execute("""
+                SELECT asset_address FROM borrower_collateral 
+                WHERE borrower_address = ?
+            """, (address,))
+            collateral_assets = [row[0] for row in cursor.fetchall()]
+            
+            # Get debt assets
+            cursor.execute("""
+                SELECT asset_address FROM borrower_debt 
+                WHERE borrower_address = ?
+            """, (address,))
+            debt_assets = [row[0] for row in cursor.fetchall()]
+            
+            # Determine status
+            if collateral_count > 0 and debt_count > 0:
+                status = 'both'
+            elif collateral_count > 0:
+                status = 'collateral_only'
+            elif debt_count > 0:
+                status = 'debt_only'
+            else:
+                status = 'neither'
+            
+            borrowers.append({
+                'address': address,
+                'collateral_count': collateral_count,
+                'debt_count': debt_count,
+                'collateral_assets': collateral_assets,
+                'debt_assets': debt_assets,
+                'status': status,
+                'created_at': created_at,
+                'updated_at': updated_at
+            })
+        
+        conn.close()
+        
+        data = {
+            'last_block_number': last_block_number,
+            'borrowers': borrowers
+        }
+        
         return jsonify(data)
+        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
