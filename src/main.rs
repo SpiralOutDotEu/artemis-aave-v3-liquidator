@@ -17,6 +17,7 @@ use strategies::{
     aave_strategy::{AaveStrategy, Deployment},
     types::{Action, Config, Event},
 };
+use storage::SqliteStorage;
 use tracing::{info, Level};
 use tracing_subscriber::{filter, prelude::*};
 use std::fs;
@@ -27,6 +28,7 @@ pub mod collectors;
 pub mod executors;
 pub mod strategies;
 pub mod addresses;
+pub mod storage;
 
 /// Default chain ID for Base network
 pub const CHAIN_ID: u64 = 8453;
@@ -227,6 +229,11 @@ async fn main() -> Result<()> {
         _ => return Err(anyhow::anyhow!("Invalid deployment: {}", deployment_name)),
     };
     
+    // Initialize SQLite storage for borrower state persistence
+    let db_path = Path::new(&config.app.data_dir).join("borrowers.db");
+    let storage = Arc::new(SqliteStorage::new(&db_path, 5)?);
+    info!("📊 SQLite storage initialized at: {}", db_path.display());
+    
     // Initialize the Aave liquidation strategy
     let strategy = AaveStrategy::new(
         Arc::new(provider.clone()),
@@ -235,6 +242,7 @@ async fn main() -> Result<()> {
         addresses,
         chain.start_block, // Use configured start block for efficient scanning
         config.app.data_dir.clone(), // Pass data directory for cache and logs
+        storage, // Pass SQLite storage backend
     );
     engine.add_strategy(Box::new(strategy));
     
