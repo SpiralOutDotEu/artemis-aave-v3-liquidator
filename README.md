@@ -51,6 +51,20 @@ cargo run -- --config config/bot.toml --mode simulate
 cargo run -- --config config/bot.toml --collector block
 ```
 
+### 3. Run the Log Viewer (Optional)
+
+The bot includes a web-based log viewer for monitoring activity:
+
+```bash
+# Start the log viewer (runs on http://localhost:5000)
+python3 log_viewer.py
+
+# Or use the provided script
+./start_log_viewer.sh
+```
+
+**Note**: The log viewer reads from the SQLite database (`.botdata/borrowers.db`) which is automatically created on first run.
+
 ## ✨ New Features (Milestone 1)
 
 ### 🔧 Configuration System Overhaul
@@ -207,6 +221,25 @@ The bot provides comprehensive monitoring with:
 # Logs include full context: file names, line numbers, thread IDs
 ```
 
+### Web-Based Log Viewer
+
+The bot includes a built-in web interface for monitoring:
+
+```bash
+# Start the log viewer
+python3 log_viewer.py
+
+# Access at: http://localhost:5000
+```
+
+**Features:**
+
+- Real-time log monitoring
+- Borrower data visualization
+- SQLite database integration
+- Filtered log views
+- Performance metrics
+
 ### Performance Monitoring
 
 ```bash
@@ -218,7 +251,22 @@ grep "💓 Bot heartbeat" .botdata/logs/bot_*.log
 
 # Monitor liquidation opportunities
 grep "💰 Found opportunity" .botdata/logs/bot_*.log
+
+# Use the provided monitoring scripts
+./monitor_logs.sh      # Real-time log monitoring
+./analyze_logs.sh      # Log analysis and statistics
 ```
+
+## 🗄️ Storage
+
+### SQLite Database
+
+The bot uses SQLite for persistent storage:
+
+- **Database Location**: `.botdata/borrowers.db`
+- **Automatic Creation**: Database is created automatically on first run
+- **Better Performance**: Faster reads/writes with proper indexing
+- **Data Integrity**: ACID transactions prevent corruption
 
 ## 🧪 Testing
 
@@ -394,6 +442,51 @@ RUST_LOG=info cargo run -- --config config/bot.toml --chain base --deployment AA
 ./start_log_viewer.sh
 ```
 
+### Log Viewer Issues
+
+**"Module not found" errors:**
+
+```bash
+# Install required Python packages
+pip3 install flask flask-cors
+
+# Or use the provided script
+./start_log_viewer.sh
+```
+
+**"Database not found" errors:**
+
+```bash
+# Check if SQLite database exists
+ls -la .botdata/borrowers.db
+
+# If missing, the bot will create it automatically on first run
+# No migration needed - start fresh with SQLite
+```
+
+**"Port already in use" errors:**
+
+```bash
+# Check what's using port 5000
+lsof -i :5000
+
+# Kill the process or use a different port
+python3 log_viewer.py --port 5001
+```
+
+**Rate Limiting (429 Errors):**
+
+```bash
+# Check for rate limiting in logs
+grep '429\|rate limit\|throttle' .botdata/logs/*.log
+
+# Reduce RPC load by editing config/bot.toml:
+# [rate_limiting]
+# log_block_range = 50             # Reduce from 100 to 50
+# request_delay_ms = 1000          # Increase from 500 to 1000ms
+# max_concurrent_requests = 2      # Reduce from 3 to 2
+```
+
 ## 📚 CLI Reference
 
 ### Global Options
@@ -430,6 +523,61 @@ cargo run -- --config my_config.toml --chain base --deployment AAVE
 - **Rotate private keys** regularly
 - **Monitor gas usage** and profit thresholds
 - **Test in simulation mode** before live trading
+
+## 🚀 Quick Reference
+
+### Essential Commands
+
+```bash
+# Run the bot
+cargo run -- --config config/bot.toml
+
+# Start log viewer
+python3 log_viewer.py
+
+# Monitor logs
+./monitor_logs.sh
+```
+
+### File Locations
+
+- **Configuration**: `config/bot.toml`
+- **Environment**: `config/secrets.env`
+- **Database**: `.botdata/borrowers.db`
+- **Logs**: `.botdata/logs/bot_*.log`
+- **Web Interface**: http://localhost:5000
+
+### Important Configuration Notes
+
+- **start_block**: The bot will **never scan earlier** than this block, even if cached data exists from previous runs
+- **Rate limiting**: Adjust `[rate_limiting]` section if you encounter 429 errors
+- **Database**: SQLite database is created automatically and persists between bot restarts
+
+### Rate Limiting & Retry Configuration
+
+If you encounter RPC rate limiting errors (429) or network issues, adjust these settings in `config/bot.toml`:
+
+```toml
+[rate_limiting]
+log_block_range = 100            # Number of blocks per RPC call (reduce if getting 429 errors)
+request_delay_ms = 500           # Delay between requests in milliseconds
+max_concurrent_requests = 3      # Maximum concurrent RPC requests
+retry_attempts = 3               # Number of retry attempts for failed requests
+retry_delay_ms = 1000            # Delay before retrying failed requests
+```
+
+**Key Features:**
+
+- **Automatic Retries**: Failed RPC calls are automatically retried with exponential backoff
+- **No Data Loss**: Blocks are never skipped due to temporary failures
+- **Exponential Backoff**: Retry delays increase progressively (1s, 2s, 4s, etc.)
+- **Comprehensive Coverage**: All log types (borrow, supply, repay, withdraw, liquidation) use retry logic
+
+**Recommended settings by RPC provider type:**
+
+- **Free/Public endpoints**: `log_block_range = 50`, `request_delay_ms = 1000`
+- **Paid endpoints**: `log_block_range = 100`, `request_delay_ms = 500`
+- **High-capacity endpoints**: `log_block_range = 200`, `request_delay_ms = 200`
 
 ## 📈 Next Steps
 
