@@ -1,5 +1,7 @@
 use crate::collectors::time_collector::NewTick;
 use crate::storage::Storage;
+use bot_config::types::BorrowerManagementCfg;
+
 use crate::strategies::types::Config;
 use anyhow::{anyhow, Result};
 use artemis_core::executors::mempool_executor::{GasBidInfo, SubmitTxToMempool};
@@ -26,8 +28,11 @@ use std::iter::zip;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
+use tokio::time;
 
 use super::types::{Action, Event};
+
+
 
 /// Configuration for a specific blockchain deployment
 /// 
@@ -106,6 +111,14 @@ pub struct Borrower {
     pub collateral: HashSet<Address>,
     /// Set of assets the user has borrowed (creating debt)
     pub debt: HashSet<Address>,
+    /// Whether this borrower needs reconciliation from chain (marked as dirty)
+    pub is_dirty: bool,
+    /// Last block number where this borrower's position was modified
+    pub last_touched_block: u64,
+    /// Last known health factor (in basis points, 1000 = 1.0)
+    pub last_health_factor: Option<u64>,
+    /// Last time this borrower was reconciled from chain
+    pub last_reconciled_block: Option<u64>,
 }
 
 /// Configuration for a specific ERC20 token in the Aave V3 protocol
@@ -175,6 +188,8 @@ pub struct AaveStrategy<M> {
     max_concurrent_requests: usize,
     retry_attempts: u32,
     retry_delay_ms: u64,
+    /// Borrower management configuration
+    borrower_config: BorrowerManagementCfg,
 }
 
 impl<M: Middleware + 'static> AaveStrategy<M> {
@@ -204,7 +219,18 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         start_block: u64,
         data_dir: String,
         storage: Arc<dyn Storage>,
+        borrower_config: Option<BorrowerManagementCfg>,
     ) -> Self {
+        let borrower_config = borrower_config.unwrap_or_else(|| BorrowerManagementCfg {
+            stale_borrower_ttl_blocks: 10000,
+            reconcile_interval_blocks: 100,
+            max_reconcile_per_cycle: 50,
+            enable_auto_pruning: true,
+            track_token_transfers: true,
+            min_hf_threshold_for_reconcile: 1000,
+            always_resume_from_cache: true,
+        });
+        
         Self {
             client,
             bid_percentage: config.bid_percentage,
@@ -233,6 +259,8 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
             max_concurrent_requests: 3,
             retry_attempts: 3,
             retry_delay_ms: 1000,
+            // Borrower management configuration
+            borrower_config,
         }
     }
 }
@@ -260,6 +288,8 @@ impl<M: Middleware + 'static> Strategy<Event, Action> for AaveStrategy<M> {
     /// 
     /// This method is called during startup to ensure the strategy has
     /// the latest information about tokens, approvals, and borrower positions.
+    /// It intelligently resumes from the last processed block to avoid reprocessing
+    /// historical data unnecessarily.
     /// 
     /// # Returns
     /// * `Result<()>` - Success or error from synchronization
@@ -271,10 +301,23 @@ impl<M: Middleware + 'static> Strategy<Event, Action> for AaveStrategy<M> {
         self.approve_tokens().await?;
         self.load_cache().await?;
         
-        info!("📍 Effective start block after cache load: {}", self.last_block_number);
-        self.update_state().await?;
+        info!("📍 Resume block: {} (will process from here)", self.last_block_number);
+        
+        // Only update state if we have blocks to process
+        let latest_block = self.client.get_block_number().await?;
+        if latest_block.as_u64() > self.last_block_number {
+            info!("📊 Processing {} blocks to catch up to current blockchain state", 
+                  latest_block.as_u64() - self.last_block_number);
+            self.update_state().await?;
+        } else {
+            info!("✅ Bot is already up to date at block {}", latest_block);
+        }
 
         info!("✅ State synchronization complete");
+        
+        // Show final state summary
+        self.show_state_summary();
+        
         Ok(())
     }
 
@@ -356,6 +399,8 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         }
 
         info!("📊 Total borrowers monitored: {}", self.borrowers.len());
+        info!("📍 Current blockchain position: block {} (last processed: {})", 
+              self.client.get_block_number().await.unwrap_or_default(), self.last_block_number);
         
         // Check for liquidation opportunities
         info!("🔍 Scanning for liquidation opportunities...");
@@ -459,23 +504,27 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
     async fn load_cache(&mut self) -> Result<()> {
         match self.storage.load_cache().await {
             Ok(cache) => {
-                info!("Loaded state cache from storage: {} borrowers, last block: {}", 
+                info!("📂 Loaded state cache from storage: {} borrowers, last processed block: {}", 
                       cache.borrowers.len(), cache.last_block_number);
                 
-                // Ensure we never go earlier than the configured start_block
-                let effective_start_block = std::cmp::max(cache.last_block_number, self.config.creation_block);
-                
-                if effective_start_block != cache.last_block_number {
-                    info!("⚠️ Adjusted start block from {} to {} (respecting configured start_block: {})", 
-                          cache.last_block_number, effective_start_block, self.config.creation_block);
+                if self.borrower_config.always_resume_from_cache {
+                    // Use the cached last block as our starting point for this run
+                    // This ensures we resume from where we left off, not from the beginning
+                    self.last_block_number = cache.last_block_number;
+                    self.borrowers = cache.borrowers;
+                    
+                    info!("🔄 Bot will resume processing from block {} (cached from previous run)", self.last_block_number);
+                } else {
+                    // Force fresh start from configured start block
+                    info!("🔄 Force fresh start: ignoring cache, starting from configured start block: {}", self.config.creation_block);
+                    self.last_block_number = self.config.creation_block;
+                    self.borrowers = HashMap::new();
                 }
-                
-                self.last_block_number = effective_start_block;
-                self.borrowers = cache.borrowers;
             }
             Err(e) => {
-                info!("Failed to load state cache from storage: {}, using creation block: {}", e, self.config.creation_block);
+                info!("📂 No existing cache found: {}, starting fresh from configured start block: {}", e, self.config.creation_block);
                 self.last_block_number = self.config.creation_block;
+                info!("🆕 Bot will start fresh from block {} (configured in bot.toml)", self.last_block_number);
             }
         };
 
@@ -485,12 +534,8 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
     /// Updates the bot's internal state by processing all blockchain events since last update
     /// 
     /// This comprehensive method processes multiple types of events to maintain an accurate
-    /// picture of all borrower positions:
-    /// 1. Borrow events (add debt)
-    /// 2. Supply events (add collateral) 
-    /// 3. Repay events (reduce debt)
-    /// 4. Withdraw events (reduce collateral)
-    /// 5. Liquidation events (remove liquidated borrowers)
+    /// picture of all borrower positions. It intelligently resumes from the last processed
+    /// block, ensuring no blocks are missed between restarts.
     /// 
     /// The method processes events in chunks to respect RPC limits and provides
     /// detailed progress information for monitoring.
@@ -501,10 +546,29 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
         let latest_block = self.client.get_block_number().await?;
         let total_blocks = latest_block.as_u64() - self.last_block_number;
         
-        info!(
-            "🔄 Updating state from block {} to {} ({} blocks to process)",
-            self.last_block_number, latest_block, total_blocks
-        );
+        // Safety check: ensure we never go backwards
+        if latest_block.as_u64() < self.last_block_number {
+            warn!("⚠️ Blockchain appears to have reverted: current block {} < last processed block {}", 
+                  latest_block, self.last_block_number);
+            warn!("🔄 Adjusting last_block_number to current block to prevent errors");
+            self.last_block_number = latest_block.as_u64();
+            return Ok(());
+        }
+        
+        // Show resume information
+        if total_blocks == 0 {
+            info!("💤 No new blocks to process - bot is up to date at block {}", latest_block);
+            return Ok(());
+        }
+        
+        // Check if this is a fresh start or a resume
+        if self.last_block_number == self.config.creation_block {
+            info!("🆕 Fresh start: Processing {} blocks from configured start block {} to current block {}", 
+                  total_blocks, self.config.creation_block, latest_block);
+        } else {
+            info!("🔄 Resuming: Processing {} blocks from last processed block {} to current block {} (gap: {} blocks)", 
+                  total_blocks, self.last_block_number, latest_block, total_blocks);
+        }
 
         if total_blocks > 0 {
             // Process all relevant events to maintain accurate borrower state
@@ -523,6 +587,8 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 if self.borrowers.contains_key(&user) {
                     let borrower = self.borrowers.get_mut(&user).unwrap();
                     borrower.debt.insert(log.reserve);
+                    borrower.is_dirty = true;
+                    borrower.last_touched_block = latest_block.as_u64();
                     existing_borrowers += 1;
                 } else {
                     self.borrowers.insert(
@@ -531,6 +597,10 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                             address: user,
                             collateral: HashSet::new(),
                             debt: HashSet::from([log.reserve]),
+                            is_dirty: true,
+                            last_touched_block: latest_block.as_u64(),
+                            last_health_factor: None,
+                            last_reconciled_block: None,
                         },
                     );
                     new_borrowers += 1;
@@ -553,6 +623,8 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 if self.borrowers.contains_key(&user) {
                     let borrower = self.borrowers.get_mut(&user).unwrap();
                     borrower.collateral.insert(log.reserve);
+                    borrower.is_dirty = true;
+                    borrower.last_touched_block = latest_block.as_u64();
                     existing_collateral_users += 1;
                 } else {
                     self.borrowers.insert(
@@ -561,6 +633,10 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                             address: user,
                             collateral: HashSet::new(),
                             debt: HashSet::new(),
+                            is_dirty: true,
+                            last_touched_block: latest_block.as_u64(),
+                            last_health_factor: None,
+                            last_reconciled_block: None,
                         },
                     );
                     new_collateral_users += 1;
@@ -580,6 +656,8 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 let user = log.user;
                 if let Some(borrower) = self.borrowers.get_mut(&user) {
                     borrower.debt.remove(&log.reserve);
+                    borrower.is_dirty = true;
+                    borrower.last_touched_block = latest_block.as_u64();
                     repayments_processed += 1;
                     
                     // Check if borrower has no more debt
@@ -601,6 +679,8 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 let user = log.user;
                 if let Some(borrower) = self.borrowers.get_mut(&user) {
                     borrower.collateral.remove(&log.reserve);
+                    borrower.is_dirty = true;
+                    borrower.last_touched_block = latest_block.as_u64();
                     withdrawals_processed += 1;
                     
                     // Check if borrower has no more debt or collateral
@@ -655,6 +735,26 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
             
             info!("✅ State update complete. Total borrowers: {} (processed {} blocks, removed {} inactive)", 
                   final_count, total_blocks, total_removed);
+            
+            // Reconcile dirty borrowers if it's time
+            if self.should_reconcile_borrowers() {
+                match self.reconcile_dirty_borrowers(latest_block.as_u64()).await {
+                    Ok(_) => info!("✅ Borrower reconciliation completed successfully"),
+                    Err(e) => {
+                        error!("❌ Borrower reconciliation failed: {}", e);
+                        // Don't fail the entire state update, just log the error
+                    }
+                }
+            }
+            
+            // Prune stale borrowers
+            match self.prune_stale_borrowers(latest_block.as_u64()).await {
+                Ok(_) => info!("✅ Borrower pruning completed successfully"),
+                Err(e) => {
+                    error!("❌ Borrower pruning failed: {}", e);
+                    // Don't fail the entire state update, just log the error
+                }
+            }
         } else {
             info!("💤 No new blocks to process - blockchain is quiet");
         }
@@ -1599,6 +1699,10 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
             address: borrower_address,
             collateral,
             debt,
+            is_dirty: _,
+            last_touched_block: _,
+            last_health_factor: _,
+            last_reconciled_block: _,
         } = borrower;
         
         // TODO: Handle users with multiple collateral/debt positions
@@ -1704,6 +1808,241 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
     async fn build_liquidation(&self, op: &LiquidationOpportunity) -> Result<TypedTransaction> {
         let mut call = self.build_liquidation_call(op).await?;
         Ok(call.tx.set_chain_id(self.chain_id).clone())
+    }
+    
+    /// Marks a borrower as dirty (needs reconciliation)
+    async fn mark_borrower_dirty(&mut self, address: Address, block_number: u64) -> Result<()> {
+        if let Some(borrower) = self.borrowers.get_mut(&address) {
+            borrower.is_dirty = true;
+            borrower.last_touched_block = block_number;
+        }
+        
+        // Also mark in storage
+        self.storage.mark_borrower_dirty(&address, block_number).await?;
+        
+        Ok(())
+    }
+    
+    /// Reconciles a borrower's position from the blockchain
+    async fn reconcile_borrower(&mut self, address: Address, current_block: u64) -> Result<()> {
+        info!("🔄 Reconciling borrower {} from chain", format!("{:?}", address));
+        
+        // Add timeout to prevent hanging
+        let timeout_duration = time::Duration::from_secs(30); // 30 second timeout
+        
+        // Get user account data from the pool with timeout
+        let pool = Pool::<M>::new(self.config.pool_address, self.client.clone());
+        let user_data = match tokio::time::timeout(timeout_duration, pool.get_user_account_data(address).call()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(anyhow!("Timeout getting user account data for borrower {}", format!("{:?}", address)));
+            }
+        };
+        
+        // Check if user has any positions
+        // user_data is (totalCollateralBase, totalDebtBase, availableBorrowsBase, currentLiquidationThreshold, ltv, healthFactor)
+        if user_data.1 == U256::zero() && user_data.0 == U256::zero() {
+            // User has no positions, remove them
+            info!("🗑️ Borrower {} has no positions, removing from tracking", format!("{:?}", address));
+            self.borrowers.remove(&address);
+            self.storage.remove_borrower(&address).await?;
+            return Ok(());
+        }
+        
+        // Get detailed reserve data for each asset the user might have
+        let pool_data_provider = IPoolDataProvider::<M>::new(self.config.pool_data_provider, self.client.clone());
+        let reserves_tokens = match tokio::time::timeout(timeout_duration, pool_data_provider.get_all_reserves_tokens().call()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(anyhow!("Timeout getting reserves list for borrower {}", format!("{:?}", address)));
+            }
+        };
+        
+        let mut new_collateral = HashSet::new();
+        let mut new_debt = HashSet::new();
+        
+        for token_data in reserves_tokens {
+            match tokio::time::timeout(timeout_duration, pool_data_provider.get_user_reserve_data(token_data.token_address, address).call()).await {
+                Ok(result) => {
+                    match result {
+                        Ok(user_reserve_data) => {
+                            // Check if user has collateral in this reserve
+                            // user_reserve_data is (currentATokenBalance, currentStableDebt, currentVariableDebt, principalStableDebt, scaledVariableDebt, stableBorrowRate, oldStableBorrowRate, stableBorrowLastUpdatedTimestamp, usageAsCollateralEnabledOnUser)
+                            if user_reserve_data.0 > U256::zero() {
+                                new_collateral.insert(token_data.token_address);
+                            }
+                            
+                            // Check if user has debt in this reserve
+                            if user_reserve_data.1 > U256::zero() || user_reserve_data.2 > U256::zero() {
+                                new_debt.insert(token_data.token_address);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("⚠️ Failed to get reserve data for token {}: {}, skipping", format!("{:?}", token_data.token_address), e);
+                            // Continue with other tokens
+                        }
+                    }
+                }
+                Err(_) => {
+                    warn!("⚠️ Timeout getting reserve data for token {}, skipping", format!("{:?}", token_data.token_address));
+                    // Continue with other tokens
+                }
+            }
+        }
+        
+        // Update borrower state
+        if let Some(borrower) = self.borrowers.get_mut(&address) {
+            borrower.collateral = new_collateral;
+            borrower.debt = new_debt;
+            borrower.is_dirty = false;
+            borrower.last_reconciled_block = Some(current_block);
+            
+            // Update health factor if available (health factor is in basis points, e.g., 10000 = 1.0)
+            if user_data.5 > U256::zero() {
+                // Safely convert health factor, handling potential overflow
+                match TryInto::<u128>::try_into(user_data.5) {
+                    Ok(hf_u128) => {
+                        // Clamp to reasonable range to avoid overflow
+                        let clamped_hf = hf_u128.min(u128::MAX / 1000);
+                        borrower.last_health_factor = Some(clamped_hf as u64);
+                    }
+                    Err(_) => {
+                        warn!("⚠️ Health factor overflow for borrower {}, skipping", format!("{:?}", address));
+                        borrower.last_health_factor = None;
+                    }
+                }
+            }
+            
+            // Update in storage
+            self.storage.update_borrower(borrower).await?;
+            self.storage.mark_borrower_reconciled(&address, current_block).await?;
+            
+            info!("✅ Reconciled borrower {}: {} collateral, {} debt assets", 
+                  format!("{:?}", address), borrower.collateral.len(), borrower.debt.len());
+        }
+        
+        Ok(())
+    }
+    
+    /// Reconciles all dirty borrowers
+    async fn reconcile_dirty_borrowers(&mut self, current_block: u64) -> Result<()> {
+        let dirty_borrowers = self.storage.get_dirty_borrowers().await?;
+        
+        if dirty_borrowers.is_empty() {
+            return Ok(());
+        }
+        
+        info!("🔄 Reconciling {} dirty borrowers", dirty_borrowers.len());
+        
+        // Limit the number of borrowers to reconcile per cycle to avoid RPC overload
+        let max_reconcile = self.borrower_config.max_reconcile_per_cycle;
+        let borrowers_to_reconcile = dirty_borrowers.iter().take(max_reconcile).cloned().collect::<Vec<_>>();
+        
+        let mut success_count = 0;
+        let mut error_count = 0;
+        
+        for (index, address) in borrowers_to_reconcile.iter().enumerate() {
+            // Circuit breaker: if we have too many consecutive failures, stop
+            if error_count >= 5 && success_count == 0 {
+                error!("🚨 Circuit breaker triggered: too many consecutive reconciliation failures");
+                break;
+            }
+            
+            match self.reconcile_borrower(*address, current_block).await {
+                Ok(_) => {
+                    success_count += 1;
+                    error_count = 0; // Reset error count on success
+                    
+                    // Add delay between reconciliations to avoid RPC throttling
+                    if self.request_delay_ms > 0 {
+                        time::sleep(time::Duration::from_millis(self.request_delay_ms)).await;
+                    }
+                    
+                    // Progress indicator for large batches
+                    if borrowers_to_reconcile.len() > 10 && (index + 1) % 10 == 0 {
+                        info!("🔄 Reconciliation progress: {}/{} completed", index + 1, borrowers_to_reconcile.len());
+                    }
+                }
+                Err(e) => {
+                    error_count += 1;
+                    error!("❌ Failed to reconcile borrower {}: {}", format!("{:?}", address), e);
+                    
+                    // Add longer delay on errors to avoid overwhelming the system
+                    if self.request_delay_ms > 0 {
+                        time::sleep(time::Duration::from_millis(self.request_delay_ms * 2)).await;
+                    }
+                    
+                    // Continue with other borrowers unless circuit breaker is triggered
+                }
+            }
+        }
+        
+        info!("✅ Reconciliation complete: {} successful, {} failed", success_count, error_count);
+        Ok(())
+    }
+    
+    /// Prunes stale borrowers based on TTL
+    async fn prune_stale_borrowers(&mut self, current_block: u64) -> Result<()> {
+        if !self.borrower_config.enable_auto_pruning {
+            return Ok(());
+        }
+        
+        let ttl_blocks = self.borrower_config.stale_borrower_ttl_blocks;
+        let stale_borrowers = self.storage.get_stale_borrowers(current_block, ttl_blocks).await?;
+        
+        if stale_borrowers.is_empty() {
+            return Ok(());
+        }
+        
+        info!("🗑️ Pruning {} stale borrowers (TTL: {} blocks)", stale_borrowers.len(), ttl_blocks);
+        
+        for address in stale_borrowers {
+            // Quick check if borrower still has positions
+            let pool = Pool::<M>::new(self.config.pool_address, self.client.clone());
+            let user_data = pool.get_user_account_data(address).call().await?;
+            
+            // user_data is (totalCollateralBase, totalDebtBase, availableBorrowsBase, currentLiquidationThreshold, ltv, healthFactor)
+            if user_data.1 == U256::zero() && user_data.0 == U256::zero() {
+                // Borrower has no positions, safe to remove
+                self.borrowers.remove(&address);
+                self.storage.remove_borrower(&address).await?;
+                info!("🗑️ Pruned stale borrower {} (no positions)", format!("{:?}", address));
+            } else {
+                // Borrower still has positions, mark as dirty for reconciliation
+                self.mark_borrower_dirty(address, current_block).await?;
+                info!("🔄 Marked stale borrower {} as dirty (has positions)", format!("{:?}", address));
+            }
+            
+            // Add delay between checks to avoid RPC throttling
+            if self.request_delay_ms > 0 {
+                time::sleep(time::Duration::from_millis(self.request_delay_ms)).await;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Shows a summary of the current bot state and resume information
+    pub fn show_state_summary(&self) {
+        info!("📊 === BOT STATE SUMMARY ===");
+        info!("📍 Configured start block: {} (from bot.toml)", self.config.creation_block);
+        info!("📍 Last processed block: {}", self.last_block_number);
+        info!("📍 Total borrowers tracked: {}", self.borrowers.len());
+        info!("📍 Dirty borrowers: {}", self.borrowers.values().filter(|b| b.is_dirty).count());
+        info!("📊 === END SUMMARY ===");
+    }
+    
+    /// Determines if it's time to reconcile borrowers based on configuration
+    fn should_reconcile_borrowers(&self) -> bool {
+        let reconcile_interval = self.borrower_config.reconcile_interval_blocks;
+        if reconcile_interval == 0 {
+            return true; // Reconcile every block
+        }
+        
+        // Check if we've processed enough blocks since last reconciliation
+        // For now, we'll reconcile every time update_state is called
+        // In a more sophisticated implementation, we could track the last reconciliation block
+        true
     }
 }
 
