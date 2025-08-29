@@ -79,4 +79,40 @@ pub trait Storage: Send + Sync {
     /// # Returns
     /// * `Result<()>` - Success or error from setting
     async fn set_last_block_number(&self, block_number: u64) -> Result<()>;
+    
+    /// Marks a borrower as dirty (needs reconciliation)
+    /// 
+    /// # Arguments
+    /// * `address` - The address of the borrower to mark as dirty
+    /// * `block_number` - The current block number
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error from marking as dirty
+    async fn mark_borrower_dirty(&self, address: &ethers::types::Address, block_number: u64) -> Result<()>;
+    
+    /// Gets all dirty borrowers that need reconciliation
+    /// 
+    /// # Returns
+    /// * `Result<Vec<Address>>` - List of dirty borrower addresses
+    async fn get_dirty_borrowers(&self) -> Result<Vec<ethers::types::Address>>;
+    
+    /// Marks a borrower as reconciled (no longer dirty)
+    /// 
+    /// # Arguments
+    /// * `address` - The address of the borrower to mark as reconciled
+    /// * `block_number` - The current block number
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error from marking as reconciled
+    async fn mark_borrower_reconciled(&self, address: &ethers::types::Address, block_number: u64) -> Result<()>;
+    
+    /// Gets borrowers that are stale and should be pruned
+    /// 
+    /// # Arguments
+    /// * `current_block` - The current block number
+    /// * `ttl_blocks` - The TTL in blocks for considering borrowers stale
+    /// 
+    /// # Returns
+    /// * `Result<Vec<Address>>` - List of stale borrower addresses
+    async fn get_stale_borrowers(&self, current_block: u64, ttl_blocks: u64) -> Result<Vec<ethers::types::Address>>;
 }

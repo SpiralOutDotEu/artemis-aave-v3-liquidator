@@ -64,12 +64,16 @@ impl SqliteStorage {
     fn initialize_schema(&self) -> Result<()> {
         let conn = self.get_connection()?;
         
-        // Create borrowers table
+        // Create borrowers table with new fields for dirty tracking
         conn.execute(
             "CREATE TABLE IF NOT EXISTS borrowers (
                 address TEXT PRIMARY KEY NOT NULL,
                 collateral_count INTEGER NOT NULL DEFAULT 0,
                 debt_count INTEGER NOT NULL DEFAULT 0,
+                is_dirty INTEGER NOT NULL DEFAULT 1,
+                last_touched_block INTEGER NOT NULL DEFAULT 0,
+                last_health_factor INTEGER,
+                last_reconciled_block INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )",
@@ -110,6 +114,9 @@ impl SqliteStorage {
             [],
         ).with_context(|| "Failed to create bot_state table")?;
         
+        // Add new columns to existing borrowers table if they don't exist
+        self.migrate_schema(&conn)?;
+        
         // Create indices for better query performance
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_borrower_collateral_asset ON borrower_collateral(asset_address)",
@@ -127,6 +134,35 @@ impl SqliteStorage {
         ).with_context(|| "Failed to create borrowers updated index")?;
         
         info!("Database schema initialized successfully");
+        Ok(())
+    }
+    
+    /// Migrates the schema to add new columns if they don't exist
+    fn migrate_schema(&self, conn: &Connection) -> Result<()> {
+        // Check if new columns exist and add them if they don't
+        let columns = ["is_dirty", "last_touched_block", "last_health_factor", "last_reconciled_block"];
+        
+        for column in &columns {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('borrowers') WHERE name = ?)",
+                [column],
+                |row| row.get(0),
+            ).unwrap_or(false);
+            
+            if !exists {
+                let sql = match *column {
+                    "is_dirty" => "ALTER TABLE borrowers ADD COLUMN is_dirty INTEGER NOT NULL DEFAULT 1",
+                    "last_touched_block" => "ALTER TABLE borrowers ADD COLUMN last_touched_block INTEGER NOT NULL DEFAULT 0",
+                    "last_health_factor" => "ALTER TABLE borrowers ADD COLUMN last_health_factor INTEGER",
+                    "last_reconciled_block" => "ALTER TABLE borrowers ADD COLUMN last_reconciled_block INTEGER",
+                    _ => continue,
+                };
+                
+                conn.execute(sql, [])
+                    .with_context(|| format!("Failed to add column {} to borrowers table", column))?;
+            }
+        }
+        
         Ok(())
     }
     
@@ -208,7 +244,7 @@ impl super::Storage for SqliteStorage {
         let mut borrowers = HashMap::new();
         
         let mut borrower_rows = conn.prepare(
-            "SELECT address, collateral_count, debt_count FROM borrowers"
+            "SELECT address, collateral_count, debt_count, is_dirty, last_touched_block, last_health_factor, last_reconciled_block FROM borrowers"
         ).with_context(|| "Failed to prepare borrowers query")?;
         
         let mut borrower_iter = borrower_rows.query([])
@@ -218,6 +254,11 @@ impl super::Storage for SqliteStorage {
             let address: String = borrower_row.get(0)?;
             let address = address.parse()
                 .with_context(|| format!("Invalid address format: {}", address))?;
+            
+            let is_dirty: bool = borrower_row.get(3)?;
+            let last_touched_block: u64 = borrower_row.get(4)?;
+            let last_health_factor: Option<u64> = borrower_row.get(5)?;
+            let last_reconciled_block: Option<u64> = borrower_row.get(6)?;
             
             // Get collateral assets
             let collateral = self.get_borrower_assets(&conn, &address, "collateral")?;
@@ -229,6 +270,10 @@ impl super::Storage for SqliteStorage {
                 address,
                 collateral,
                 debt,
+                is_dirty,
+                last_touched_block,
+                last_health_factor,
+                last_reconciled_block,
             });
         }
         
@@ -269,11 +314,15 @@ impl super::Storage for SqliteStorage {
             
             // Insert borrower record
             tx.execute(
-                "INSERT INTO borrowers (address, collateral_count, debt_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO borrowers (address, collateral_count, debt_count, is_dirty, last_touched_block, last_health_factor, last_reconciled_block, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     &address_str,
                     borrower.collateral.len() as i64,
                     borrower.debt.len() as i64,
+                    borrower.is_dirty as i64,
+                    borrower.last_touched_block as i64,
+                    borrower.last_health_factor.map(|hf| hf as i64),
+                    borrower.last_reconciled_block.map(|b| b as i64),
                     timestamp,
                     timestamp,
                 ),
@@ -320,17 +369,21 @@ impl super::Storage for SqliteStorage {
         let tx = conn.transaction()
             .with_context(|| "Failed to start database transaction")?;
         
-        // Insert borrower record
-        tx.execute(
-            "INSERT OR REPLACE INTO borrowers (address, collateral_count, debt_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (
-                &address_str,
-                borrower.collateral.len() as i64,
-                borrower.debt.len() as i64,
-                timestamp,
-                timestamp,
-            ),
-        ).with_context(|| format!("Failed to insert borrower: {}", address_str))?;
+                    // Insert borrower record
+            tx.execute(
+                "INSERT OR REPLACE INTO borrowers (address, collateral_count, debt_count, is_dirty, last_touched_block, last_health_factor, last_reconciled_block, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    &address_str,
+                    borrower.collateral.len() as i64,
+                    borrower.debt.len() as i64,
+                    borrower.is_dirty as i64,
+                    borrower.last_touched_block as i64,
+                    borrower.last_health_factor.map(|hf| hf as i64),
+                    borrower.last_reconciled_block.map(|b| b as i64),
+                    timestamp,
+                    timestamp,
+                ),
+            ).with_context(|| format!("Failed to insert borrower: {}", address_str))?;
         
         // Insert collateral assets
         for asset in &borrower.collateral {
@@ -375,10 +428,14 @@ impl super::Storage for SqliteStorage {
         
         // Update borrower record
         tx.execute(
-            "UPDATE borrowers SET collateral_count = ?, debt_count = ?, updated_at = ? WHERE address = ?",
+            "UPDATE borrowers SET collateral_count = ?, debt_count = ?, is_dirty = ?, last_touched_block = ?, last_health_factor = ?, last_reconciled_block = ?, updated_at = ? WHERE address = ?",
             (
                 borrower.collateral.len() as i64,
                 borrower.debt.len() as i64,
+                borrower.is_dirty as i64,
+                borrower.last_touched_block as i64,
+                borrower.last_health_factor.map(|hf| hf as i64),
+                borrower.last_reconciled_block.map(|b| b as i64),
                 timestamp,
                 &address_str,
             ),
@@ -469,6 +526,22 @@ impl super::Storage for SqliteStorage {
             return Ok(None);
         }
         
+        // Get borrower details
+        let borrower_data = conn.query_row(
+            "SELECT is_dirty, last_touched_block, last_health_factor, last_reconciled_block FROM borrowers WHERE address = ?",
+            [&address_str],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Option<u64>>(2)?,
+                    row.get::<_, Option<u64>>(3)?,
+                ))
+            },
+        ).with_context(|| format!("Failed to get borrower data for: {}", address_str))?;
+        
+        let (is_dirty, last_touched_block, last_health_factor, last_reconciled_block) = borrower_data;
+        
         // Get collateral assets
         let collateral = self.get_borrower_assets(&conn, address, "collateral")?;
         
@@ -479,6 +552,10 @@ impl super::Storage for SqliteStorage {
             address: *address,
             collateral,
             debt,
+            is_dirty,
+            last_touched_block,
+            last_health_factor,
+            last_reconciled_block,
         };
         
         // Return connection to pool
@@ -512,6 +589,23 @@ impl super::Storage for SqliteStorage {
         
         // Now get detailed information for each borrower
         for address in borrower_addresses {
+            // Get borrower details
+            let address_str = format!("{:?}", address);
+            let borrower_data = conn.query_row(
+                "SELECT is_dirty, last_touched_block, last_health_factor, last_reconciled_block FROM borrowers WHERE address = ?",
+                [&address_str],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, Option<u64>>(2)?,
+                        row.get::<_, Option<u64>>(3)?,
+                    ))
+                },
+            ).with_context(|| format!("Failed to get borrower data for: {}", address_str))?;
+            
+            let (is_dirty, last_touched_block, last_health_factor, last_reconciled_block) = borrower_data;
+            
             // Get collateral assets
             let collateral = self.get_borrower_assets(&conn, &address, "collateral")?;
             
@@ -522,6 +616,10 @@ impl super::Storage for SqliteStorage {
                 address,
                 collateral,
                 debt,
+                is_dirty,
+                last_touched_block,
+                last_health_factor,
+                last_reconciled_block,
             });
         }
         
@@ -562,6 +660,104 @@ impl super::Storage for SqliteStorage {
         self.return_connection(conn)?;
         
         Ok(())
+    }
+    
+    /// Marks a borrower as dirty (needs reconciliation)
+    async fn mark_borrower_dirty(&self, address: &ethers::types::Address, block_number: u64) -> Result<()> {
+        let conn = self.get_connection()?;
+        let address_str = format!("{:?}", address);
+        let timestamp = Self::current_timestamp();
+        
+        conn.execute(
+            "UPDATE borrowers SET is_dirty = 1, last_touched_block = ?, updated_at = ? WHERE address = ?",
+            (block_number, timestamp, &address_str),
+        ).with_context(|| format!("Failed to mark borrower as dirty: {}", address_str))?;
+        
+        debug!("Marked borrower {} as dirty at block {}", address_str, block_number);
+        
+        // Return connection to pool
+        self.return_connection(conn)?;
+        
+        Ok(())
+    }
+    
+    /// Gets all dirty borrowers that need reconciliation
+    async fn get_dirty_borrowers(&self) -> Result<Vec<ethers::types::Address>> {
+        let conn = self.get_connection()?;
+        let mut dirty_addresses = Vec::new();
+        
+        {
+            let mut rows = conn.prepare(
+                "SELECT address FROM borrowers WHERE is_dirty = 1 ORDER BY last_touched_block ASC"
+            ).with_context(|| "Failed to prepare dirty borrowers query")?;
+            
+            let mut iter = rows.query([])
+                .with_context(|| "Failed to execute dirty borrowers query")?;
+            
+            while let Some(row) = iter.next()? {
+                let address: String = row.get(0)?;
+                let address = address.parse()
+                    .with_context(|| format!("Invalid address format: {}", address))?;
+                dirty_addresses.push(address);
+            }
+        } // rows and iter are dropped here, releasing the borrow
+        
+        // Return connection to pool
+        self.return_connection(conn)?;
+        
+        Ok(dirty_addresses)
+    }
+    
+    /// Marks a borrower as reconciled (no longer dirty)
+    async fn mark_borrower_reconciled(&self, address: &ethers::types::Address, block_number: u64) -> Result<()> {
+        let borrower: Option<Borrower> = self.get_borrower(address).await?;
+        
+        if let Some(_borrower) = borrower {
+            let conn = self.get_connection()?;
+            let address_str = format!("{:?}", address);
+            let timestamp = Self::current_timestamp();
+            
+            conn.execute(
+                "UPDATE borrowers SET is_dirty = 0, last_reconciled_block = ?, updated_at = ? WHERE address = ?",
+                (block_number, timestamp, &address_str),
+            ).with_context(|| format!("Failed to mark borrower as reconciled: {}", address_str))?;
+            
+            debug!("Marked borrower {} as reconciled at block {}", address_str, block_number);
+            
+            // Return connection to pool
+            self.return_connection(conn)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Gets borrowers that are stale and should be pruned
+    async fn get_stale_borrowers(&self, current_block: u64, ttl_blocks: u64) -> Result<Vec<ethers::types::Address>> {
+        let conn = self.get_connection()?;
+        let mut stale_addresses = Vec::new();
+        
+        let cutoff_block = current_block.saturating_sub(ttl_blocks);
+        
+        {
+            let mut rows = conn.prepare(
+                "SELECT address FROM borrowers WHERE last_touched_block < ? ORDER BY last_touched_block ASC"
+            ).with_context(|| "Failed to prepare stale borrowers query")?;
+            
+            let mut iter = rows.query([cutoff_block])
+                .with_context(|| "Failed to execute stale borrowers query")?;
+            
+            while let Some(row) = iter.next()? {
+                let address: String = row.get(0)?;
+                let address = address.parse()
+                    .with_context(|| format!("Invalid address format: {}", address))?;
+                stale_addresses.push(address);
+        }
+        } // rows and iter are dropped here, releasing the borrow
+        
+        // Return connection to pool
+        self.return_connection(conn)?;
+        
+        Ok(stale_addresses)
     }
 }
 
