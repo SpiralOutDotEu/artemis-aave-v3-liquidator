@@ -243,6 +243,7 @@ async fn main() -> Result<()> {
         chain.start_block, // Use configured start block for efficient scanning
         config.app.data_dir.clone(), // Pass data directory for cache and logs
         storage, // Pass SQLite storage backend
+        Some(config.borrower_management.clone()), // Pass borrower management configuration
     );
     engine.add_strategy(Box::new(strategy));
     
