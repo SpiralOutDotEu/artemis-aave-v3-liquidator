@@ -20,6 +20,10 @@ pub struct BotConfig {
     pub strategy: StrategyCfg,
     /// Execution and transaction parameters
     pub execution: ExecutionCfg,
+    /// Rate limiting configuration
+    pub rate_limiting: RateLimitingCfg,
+    /// Borrower management and reconciliation configuration
+    pub borrower_management: BorrowerManagementCfg,
     /// Simulation mode configuration
     pub simulation: SimulationCfg,
 }
@@ -186,4 +190,41 @@ pub struct SimulationCfg {
     pub sqlite: String,
     /// Watch for liquidations during simulation
     pub watch_liquidations: bool,
+}
+
+/// Rate limiting configuration to avoid RPC throttling
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RateLimitingCfg {
+    /// Number of blocks to process per RPC call
+    pub log_block_range: u64,
+    /// Delay between RPC requests in milliseconds
+    pub request_delay_ms: u64,
+    /// Maximum concurrent RPC requests
+    pub max_concurrent_requests: usize,
+    /// Number of retry attempts for failed requests
+    pub retry_attempts: u32,
+    /// Delay before retrying failed requests in milliseconds
+    pub retry_delay_ms: u64,
+}
+
+/// Borrower management and reconciliation configuration
+/// 
+/// Controls how the bot tracks, reconciles, and prunes borrower positions
+/// to maintain accurate state and optimal performance.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BorrowerManagementCfg {
+    /// TTL for stale borrowers (in blocks) - borrowers older than this will be pruned if they appear to have zero positions
+    pub stale_borrower_ttl_blocks: u64,
+    /// How often to reconcile dirty borrowers (in blocks) - 0 means every block
+    pub reconcile_interval_blocks: u64,
+    /// Maximum number of borrowers to reconcile per cycle to avoid RPC overload
+    pub max_reconcile_per_cycle: usize,
+    /// Whether to enable automatic pruning of zero-position borrowers
+    pub enable_auto_pruning: bool,
+    /// Whether to track aToken/debt token transfers for more accurate position tracking
+    pub track_token_transfers: bool,
+    /// Minimum health factor threshold for reconciliation (borrowers below this get priority)
+    pub min_hf_threshold_for_reconcile: u64,
+    /// Whether to always resume from cache (true) or force fresh start (false)
+    pub always_resume_from_cache: bool,
 }

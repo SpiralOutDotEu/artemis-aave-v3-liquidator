@@ -67,6 +67,23 @@ max_concurrent_requests = 3      # Maximum concurrent RPC requests
 retry_attempts = 3               # Number of retry attempts for failed requests
 retry_delay_ms = 1000            # Delay before retrying failed requests
 
+# Borrower management and reconciliation configuration
+[borrower_management]
+# TTL for stale borrowers (in blocks) - borrowers older than this will be pruned if they appear to have zero positions
+stale_borrower_ttl_blocks = 10000
+# How often to reconcile dirty borrowers (in blocks) - 0 means every block
+reconcile_interval_blocks = 100
+# Maximum number of borrowers to reconcile per cycle to avoid RPC overload
+max_reconcile_per_cycle = 50
+# Whether to enable automatic pruning of zero-position borrowers
+enable_auto_pruning = true
+# Whether to track aToken/debt token transfers for more accurate position tracking
+track_token_transfers = true
+# Minimum health factor threshold for reconciliation (borrowers below this get priority)
+min_hf_threshold_for_reconcile = 1000 # 1.0 in basis points
+# Whether to always resume from cache (true) or force fresh start (false)
+always_resume_from_cache = true
+
 [simulation]
 out_dir = ".botdata/sim"
 jsonl = "opportunities.jsonl"
