@@ -1,4 +1,5 @@
-use crate::strategies::aave_strategy::{Borrower, StateCache};
+use crate::strategies::aave_strategy::{Borrower, StateCache, MissedLiquidationEvent};
+use crate::storage::storage_trait::MissedLiquidationStats;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags};
@@ -114,6 +115,35 @@ impl SqliteStorage {
             [],
         ).with_context(|| "Failed to create bot_state table")?;
         
+        // Create missed liquidations table for analysis
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS missed_liquidations (
+                id TEXT PRIMARY KEY NOT NULL,
+                tx_hash TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                block_timestamp INTEGER NOT NULL,
+                collateral_asset TEXT NOT NULL,
+                debt_asset TEXT NOT NULL,
+                user_address TEXT NOT NULL,
+                debt_to_cover TEXT NOT NULL,
+                liquidated_collateral_amount TEXT NOT NULL,
+                liquidator TEXT NOT NULL,
+                receive_a_token INTEGER NOT NULL,
+                log_index INTEGER NOT NULL,
+                gas_price TEXT,
+                gas_used TEXT,
+                tx_fee TEXT,
+                base_fee TEXT,
+                priority_fee TEXT,
+                was_tracked_borrower INTEGER NOT NULL,
+                our_health_factor TEXT,
+                estimated_profit TEXT,
+                missed_reason TEXT,
+                recorded_at INTEGER NOT NULL
+            )",
+            [],
+        ).with_context(|| "Failed to create missed_liquidations table")?;
+        
         // Add new columns to existing borrowers table if they don't exist
         self.migrate_schema(&conn)?;
         
@@ -132,6 +162,22 @@ impl SqliteStorage {
             "CREATE INDEX IF NOT EXISTS idx_borrowers_updated ON borrowers(updated_at)",
             [],
         ).with_context(|| "Failed to create borrowers updated index")?;
+        
+        // Create indices for missed liquidations table
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_missed_liquidations_block ON missed_liquidations(block_number)",
+            [],
+        ).with_context(|| "Failed to create missed liquidations block index")?;
+        
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_missed_liquidations_user ON missed_liquidations(user_address)",
+            [],
+        ).with_context(|| "Failed to create missed liquidations user index")?;
+        
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_missed_liquidations_tracked ON missed_liquidations(was_tracked_borrower)",
+            [],
+        ).with_context(|| "Failed to create missed liquidations tracked index")?;
         
         info!("Database schema initialized successfully");
         Ok(())
@@ -759,6 +805,177 @@ impl super::Storage for SqliteStorage {
         
         Ok(stale_addresses)
     }
+    
+    /// Stores missed liquidation events for analysis
+    async fn store_missed_liquidations(&self, events: &[MissedLiquidationEvent]) -> Result<()> {
+        let mut conn = self.get_connection()?;
+        
+        // Start transaction for atomicity
+        let tx = conn.transaction()
+            .with_context(|| "Failed to start database transaction")?;
+        
+        for event in events {
+            // Build the SQL with values directly to avoid parameter limit issues
+            let sql = format!(
+                "INSERT OR REPLACE INTO missed_liquidations (
+                    id, tx_hash, block_number, block_timestamp, collateral_asset, debt_asset,
+                    user_address, debt_to_cover, liquidated_collateral_amount, liquidator,
+                    receive_a_token, log_index, gas_price, gas_used, tx_fee, base_fee,
+                    priority_fee, was_tracked_borrower, our_health_factor, estimated_profit,
+                    missed_reason, recorded_at
+                ) VALUES (
+                    '{}', '{}', {}, {}, '{}', '{}', '{}', '{}', '{}', '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}', {}
+                )",
+                event.id,
+                format!("{:?}", event.tx_hash),
+                event.block_number,
+                event.block_timestamp,
+                format!("{:?}", event.collateral_asset),
+                format!("{:?}", event.debt_asset),
+                format!("{:?}", event.user),
+                event.debt_to_cover,
+                event.liquidated_collateral_amount,
+                format!("{:?}", event.liquidator),
+                event.receive_a_token as i64,
+                event.log_index,
+                event.gas_price.as_ref().map(|gp| format!("'{}'", gp)).unwrap_or_else(|| "NULL".to_string()),
+                event.gas_used.as_ref().map(|gu| format!("'{}'", gu)).unwrap_or_else(|| "NULL".to_string()),
+                event.tx_fee.as_ref().map(|tf| format!("'{}'", tf)).unwrap_or_else(|| "NULL".to_string()),
+                event.base_fee.as_ref().map(|bf| format!("'{}'", bf)).unwrap_or_else(|| "NULL".to_string()),
+                event.priority_fee.as_ref().map(|pf| format!("'{}'", pf)).unwrap_or_else(|| "NULL".to_string()),
+                event.was_tracked_borrower as i64,
+                event.our_health_factor.as_ref().map(|hf| format!("'{}'", hf)).unwrap_or_else(|| "NULL".to_string()),
+                event.estimated_profit.as_ref().map(|ep| format!("'{}'", ep)).unwrap_or_else(|| "NULL".to_string()),
+                event.missed_reason.as_ref().unwrap_or(&"Unknown".to_string()),
+                event.recorded_at.timestamp()
+            );
+            
+            tx.execute(&sql, [])
+                .with_context(|| format!("Failed to insert missed liquidation event: {}", event.id))?;
+        }
+        
+        // Commit transaction
+        tx.commit()
+            .with_context(|| "Failed to commit missed liquidations transaction")?;
+        
+        info!("Stored {} missed liquidation events", events.len());
+        
+        // Return connection to pool
+        self.return_connection(conn)?;
+        
+        Ok(())
+    }
+    
+    /// Gets missed liquidation events within a block range
+    async fn get_missed_liquidations(&self, start_block: u64, end_block: u64) -> Result<Vec<MissedLiquidationEvent>> {
+        let conn = self.get_connection()?;
+        let mut events = Vec::new();
+        
+        {
+            let mut rows = conn.prepare(
+                "SELECT * FROM missed_liquidations WHERE block_number >= ? AND block_number <= ? ORDER BY block_number ASC"
+            ).with_context(|| "Failed to prepare missed liquidations query")?;
+            
+            let mut iter = rows.query([start_block as i64, end_block as i64])
+                .with_context(|| "Failed to execute missed liquidations query")?;
+            
+            while let Some(row) = iter.next()? {
+                let event = self.parse_missed_liquidation_row(row)?;
+                events.push(event);
+            }
+        }
+        
+        // Return connection to pool
+        self.return_connection(conn)?;
+        
+        Ok(events)
+    }
+    
+    /// Gets missed liquidation events for tracked borrowers only
+    async fn get_missed_opportunities(&self, start_block: u64, end_block: u64) -> Result<Vec<MissedLiquidationEvent>> {
+        let conn = self.get_connection()?;
+        let mut events = Vec::new();
+        
+        {
+            let mut rows = conn.prepare(
+                "SELECT * FROM missed_liquidations WHERE block_number >= ? AND block_number <= ? AND was_tracked_borrower = 1 ORDER BY block_number ASC"
+            ).with_context(|| "Failed to prepare missed opportunities query")?;
+            
+            let mut iter = rows.query([start_block as i64, end_block as i64])
+                .with_context(|| "Failed to execute missed opportunities query")?;
+            
+            while let Some(row) = iter.next()? {
+                let event = self.parse_missed_liquidation_row(row)?;
+                events.push(event);
+            }
+        }
+        
+        // Return connection to pool
+        self.return_connection(conn)?;
+        
+        Ok(events)
+    }
+    
+    /// Gets statistics about missed liquidations
+    async fn get_missed_liquidation_stats(&self, start_block: u64, end_block: u64) -> Result<MissedLiquidationStats> {
+        let conn = self.get_connection()?;
+        
+        // Get total liquidations
+        let total_liquidations: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM missed_liquidations WHERE block_number >= ? AND block_number <= ?",
+            [start_block as i64, end_block as i64],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        
+        // Get missed opportunities
+        let missed_opportunities: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM missed_liquidations WHERE block_number >= ? AND block_number <= ? AND was_tracked_borrower = 1",
+            [start_block as i64, end_block as i64],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        
+        // Get total missed profit (rough estimate)
+        let total_missed_profit: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(CAST(estimated_profit AS REAL)), 0) FROM missed_liquidations WHERE block_number >= ? AND block_number <= ? AND was_tracked_borrower = 1 AND estimated_profit IS NOT NULL",
+            [start_block as i64, end_block as i64],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+        
+        // Calculate average
+        let avg_missed_profit = if missed_opportunities > 0 {
+            total_missed_profit / missed_opportunities as f64
+        } else {
+            0.0
+        };
+        
+        // Get common missed reasons
+        let mut common_missed_reasons = Vec::new();
+        {
+            let mut rows = conn.prepare(
+                "SELECT missed_reason, COUNT(*) as count FROM missed_liquidations WHERE block_number >= ? AND block_number <= ? AND was_tracked_borrower = 1 AND missed_reason IS NOT NULL GROUP BY missed_reason ORDER BY count DESC LIMIT 10"
+            ).with_context(|| "Failed to prepare missed reasons query")?;
+            
+            let mut iter = rows.query([start_block as i64, end_block as i64])
+                .with_context(|| "Failed to execute missed reasons query")?;
+            
+            while let Some(row) = iter.next()? {
+                let reason: String = row.get(0)?;
+                let count: u64 = row.get(1)?;
+                common_missed_reasons.push((reason, count));
+            }
+        }
+        
+        // Return connection to pool
+        self.return_connection(conn)?;
+        
+        Ok(MissedLiquidationStats {
+            total_liquidations,
+            missed_opportunities,
+            total_missed_profit,
+            avg_missed_profit,
+            common_missed_reasons,
+        })
+    }
 }
 
 impl SqliteStorage {
@@ -793,6 +1010,86 @@ impl SqliteStorage {
         }
         
         Ok(assets)
+    }
+    
+    /// Helper method to parse a missed liquidation row from the database
+    fn parse_missed_liquidation_row(&self, row: &rusqlite::Row) -> Result<MissedLiquidationEvent> {
+        use chrono::{DateTime, Utc};
+        use std::str::FromStr;
+        
+        let id: String = row.get(0)?;
+        let tx_hash_str: String = row.get(1)?;
+        let tx_hash = ethers::types::H160::from_str(&tx_hash_str.trim_start_matches("0x"))
+            .with_context(|| format!("Invalid tx hash format: {}", tx_hash_str))?;
+        let block_number: i64 = row.get(2)?;
+        let block_timestamp: i64 = row.get(3)?;
+        let collateral_asset_str: String = row.get(4)?;
+        let collateral_asset = ethers::types::Address::from_str(&collateral_asset_str.trim_start_matches("0x"))
+            .with_context(|| format!("Invalid collateral asset format: {}", collateral_asset_str))?;
+        let debt_asset_str: String = row.get(5)?;
+        let debt_asset = ethers::types::Address::from_str(&debt_asset_str.trim_start_matches("0x"))
+            .with_context(|| format!("Invalid debt asset format: {}", debt_asset_str))?;
+        let user_str: String = row.get(6)?;
+        let user = ethers::types::Address::from_str(&user_str.trim_start_matches("0x"))
+            .with_context(|| format!("Invalid user address format: {}", user_str))?;
+        let debt_to_cover_str: String = row.get(7)?;
+        let debt_to_cover = ethers::types::U256::from_str(&debt_to_cover_str)
+            .with_context(|| format!("Invalid debt_to_cover format: {}", debt_to_cover_str))?;
+        let liquidated_collateral_amount_str: String = row.get(8)?;
+        let liquidated_collateral_amount = ethers::types::U256::from_str(&liquidated_collateral_amount_str)
+            .with_context(|| format!("Invalid liquidated_collateral_amount format: {}", liquidated_collateral_amount_str))?;
+        let liquidator_str: String = row.get(9)?;
+        let liquidator = ethers::types::Address::from_str(&liquidator_str.trim_start_matches("0x"))
+            .with_context(|| format!("Invalid liquidator format: {}", liquidator_str))?;
+        let receive_a_token: bool = row.get::<_, i64>(10)? != 0;
+        let log_index: u64 = row.get::<_, i64>(11)? as u64;
+        
+        let gas_price = row.get::<_, Option<String>>(12)?
+            .and_then(|s| ethers::types::U256::from_str(&s).ok());
+        let gas_used = row.get::<_, Option<String>>(13)?
+            .and_then(|s| ethers::types::U256::from_str(&s).ok());
+        let tx_fee = row.get::<_, Option<String>>(14)?
+            .and_then(|s| ethers::types::U256::from_str(&s).ok());
+        let base_fee = row.get::<_, Option<String>>(15)?
+            .and_then(|s| ethers::types::U256::from_str(&s).ok());
+        let priority_fee = row.get::<_, Option<String>>(16)?
+            .and_then(|s| ethers::types::U256::from_str(&s).ok());
+        
+        let was_tracked_borrower: bool = row.get::<_, i64>(17)? != 0;
+        
+        let our_health_factor = row.get::<_, Option<String>>(18)?
+            .and_then(|s| ethers::types::U256::from_str(&s).ok());
+        let estimated_profit = row.get::<_, Option<String>>(19)?
+            .and_then(|s| ethers::types::I256::from_str(&s).ok());
+        let missed_reason: Option<String> = row.get(20)?;
+        let recorded_at_timestamp: i64 = row.get(21)?;
+        let recorded_at = DateTime::from_timestamp(recorded_at_timestamp, 0)
+            .unwrap_or_else(|| Utc::now());
+        
+        Ok(MissedLiquidationEvent {
+            id,
+            tx_hash,
+            block_number: block_number as u64,
+            block_timestamp: block_timestamp as u64,
+            collateral_asset,
+            debt_asset,
+            user,
+            debt_to_cover,
+            liquidated_collateral_amount,
+            liquidator,
+            receive_a_token,
+            log_index,
+            gas_price,
+            gas_used,
+            tx_fee: tx_fee,
+            base_fee,
+            priority_fee,
+            was_tracked_borrower,
+            our_health_factor,
+            estimated_profit,
+            missed_reason,
+            recorded_at,
+        })
     }
 }
 
@@ -832,6 +1129,10 @@ mod tests {
             address: Address::random(),
             collateral: HashSet::from([Address::random(), Address::random()]),
             debt: HashSet::from([Address::random()]),
+            is_dirty: true,
+            last_touched_block: 0,
+            last_health_factor: None,
+            last_reconciled_block: None,
         };
         
         storage.add_borrower(&borrower).await?;
@@ -881,6 +1182,10 @@ mod tests {
                     address: Address::random(),
                     collateral: HashSet::from([Address::random()]),
                     debt: HashSet::from([Address::random()]),
+                    is_dirty: true,
+                    last_touched_block: 0,
+                    last_health_factor: None,
+                    last_reconciled_block: None,
                 };
                 
                 storage_clone.add_borrower(&borrower).await?;
