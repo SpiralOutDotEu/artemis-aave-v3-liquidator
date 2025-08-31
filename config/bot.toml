@@ -12,7 +12,7 @@ collector = "time"        # "time" | "block" | "pending"
 chain_id = 8453
 rpc_url = "${BASE_RPC_URL}"         # env override pattern
 explorer.base_url = "https://basescan.org"
-start_block = 34800000              # Bot will start scanning from this block (never earlier, even if cache exists)
+start_block = 34830000              # Bot will start scanning from this block (never earlier, even if cache exists)
 
 # Deployments under each chain (AAVE, SEAMLESS/Seashell)
 [deployments.base.AAVE]

@@ -1,4 +1,4 @@
-use crate::strategies::aave_strategy::{Borrower, StateCache};
+use crate::strategies::aave_strategy::{Borrower, StateCache, MissedLiquidationEvent};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -115,4 +115,58 @@ pub trait Storage: Send + Sync {
     /// # Returns
     /// * `Result<Vec<Address>>` - List of stale borrower addresses
     async fn get_stale_borrowers(&self, current_block: u64, ttl_blocks: u64) -> Result<Vec<ethers::types::Address>>;
+    
+    /// Stores missed liquidation events for analysis
+    /// 
+    /// # Arguments
+    /// * `events` - The missed liquidation events to store
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error from storing
+    async fn store_missed_liquidations(&self, events: &[MissedLiquidationEvent]) -> Result<()>;
+    
+    /// Gets missed liquidation events within a time range
+    /// 
+    /// # Arguments
+    /// * `start_block` - Starting block number
+    /// * `end_block` - Ending block number
+    /// 
+    /// # Returns
+    /// * `Result<Vec<MissedLiquidationEvent>>` - List of missed liquidation events
+    async fn get_missed_liquidations(&self, start_block: u64, end_block: u64) -> Result<Vec<MissedLiquidationEvent>>;
+    
+    /// Gets missed liquidation events for tracked borrowers only
+    /// 
+    /// # Arguments
+    /// * `start_block` - Starting block number
+    /// * `end_block` - Ending block number
+    /// 
+    /// # Returns
+    /// * `Result<Vec<MissedLiquidationEvent>>` - List of missed liquidation events for tracked borrowers
+    async fn get_missed_opportunities(&self, start_block: u64, end_block: u64) -> Result<Vec<MissedLiquidationEvent>>;
+    
+    /// Gets statistics about missed liquidations
+    /// 
+    /// # Arguments
+    /// * `start_block` - Starting block number
+    /// * `end_block` - Ending block number
+    /// 
+    /// # Returns
+    /// * `Result<MissedLiquidationStats>` - Statistics about missed liquidations
+    async fn get_missed_liquidation_stats(&self, start_block: u64, end_block: u64) -> Result<MissedLiquidationStats>;
+}
+
+/// Statistics about missed liquidation opportunities
+#[derive(Debug, Clone)]
+pub struct MissedLiquidationStats {
+    /// Total number of liquidations observed
+    pub total_liquidations: u64,
+    /// Number of missed opportunities (tracked borrowers)
+    pub missed_opportunities: u64,
+    /// Total estimated profit missed (in ETH)
+    pub total_missed_profit: f64,
+    /// Average profit per missed opportunity
+    pub avg_missed_profit: f64,
+    /// Most common reasons for missing opportunities
+    pub common_missed_reasons: Vec<(String, u64)>,
 }
