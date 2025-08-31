@@ -282,6 +282,80 @@ struct LiquidationOpportunity {
     profit_eth: I256,
 }
 
+/// Detailed information about a liquidation event that occurred
+/// 
+/// Captures all available information about liquidations to analyze
+/// why our bot missed the opportunity and improve future performance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissedLiquidationEvent {
+    /// Unique identifier for this liquidation event
+    pub id: String,
+    /// Transaction hash of the liquidation
+    pub tx_hash: H160,
+    /// Block number where liquidation occurred
+    pub block_number: u64,
+    /// Block timestamp when liquidation occurred
+    pub block_timestamp: u64,
+    /// Address of the collateral asset being liquidated
+    pub collateral_asset: Address,
+    /// Address of the debt asset being repaid
+    pub debt_asset: Address,
+    /// Address of the user being liquidated
+    pub user: Address,
+    /// Amount of debt covered in the liquidation
+    pub debt_to_cover: U256,
+    /// Amount of collateral liquidated
+    pub liquidated_collateral_amount: U256,
+    /// Address of the liquidator who executed the liquidation
+    pub liquidator: Address,
+    /// Whether the liquidator received aTokens
+    pub receive_a_token: bool,
+    /// Log index within the block
+    pub log_index: u64,
+    /// Gas price used for the transaction
+    pub gas_price: Option<U256>,
+    /// Gas used for the transaction
+    pub gas_used: Option<U256>,
+    /// Transaction fee in ETH
+    pub tx_fee: Option<U256>,
+    /// Block base fee (EIP-1559)
+    pub base_fee: Option<U256>,
+    /// Priority fee (EIP-1559)
+    pub priority_fee: Option<U256>,
+    /// Whether this was a missed opportunity (we were tracking the borrower)
+    pub was_tracked_borrower: bool,
+    /// Our bot's health factor for this user at the time (if available)
+    pub our_health_factor: Option<U256>,
+    /// Estimated profit we would have made (if calculable)
+    pub estimated_profit: Option<I256>,
+    /// Reason why we missed this opportunity (if determinable)
+    pub missed_reason: Option<String>,
+    /// When this event was recorded in our database
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Transaction details for analyzing missed liquidations
+#[derive(Debug, Clone)]
+pub struct TransactionDetails {
+    /// Gas price used for the transaction
+    pub gas_price: Option<U256>,
+    /// Gas used for the transaction
+    pub gas_used: Option<U256>,
+    /// Total transaction fee
+    pub fee: Option<U256>,
+    /// Maximum priority fee per gas (EIP-1559)
+    pub max_priority_fee_per_gas: Option<U256>,
+}
+
+/// Block details for analyzing missed liquidations
+#[derive(Debug, Clone)]
+pub struct BlockDetails {
+    /// Block timestamp
+    pub timestamp: Option<u64>,
+    /// Base fee per gas (EIP-1559)
+    pub base_fee_per_gas: Option<U256>,
+}
+
 #[async_trait]
 impl<M: Middleware + 'static> Strategy<Event, Action> for AaveStrategy<M> {
     /// Synchronizes the strategy's internal state with the blockchain
@@ -507,7 +581,14 @@ impl<M: Middleware + 'static> AaveStrategy<M> {
                 info!("📂 Loaded state cache from storage: {} borrowers, last processed block: {}", 
                       cache.borrowers.len(), cache.last_block_number);
                 
-                if self.borrower_config.always_resume_from_cache {
+                // CRITICAL: Never resume from a block earlier than the configured start_block
+                if cache.last_block_number < self.config.creation_block {
+                    warn!("⚠️ Cached block {} is earlier than configured start_block {}. Ignoring cache and starting fresh.", 
+                          cache.last_block_number, self.config.creation_block);
+                    self.last_block_number = self.config.creation_block;
+                    self.borrowers = HashMap::new();
+                    info!("🆕 Bot will start fresh from configured start block: {} (ignoring invalid cache)", self.config.creation_block);
+                } else if self.borrower_config.always_resume_from_cache {
                     // Use the cached last block as our starting point for this run
                     // This ensures we resume from where we left off, not from the beginning
                     self.last_block_number = cache.last_block_number;
